@@ -22,6 +22,20 @@ import pandas as pd
 
 
 # =============================================================================
+# 属性分类配置
+# =============================================================================
+# 夜间合法为0的属性：夜间无光照/无发电，值为0是正常的
+NIGHTTIME_ZERO_COLS = {"power", "sr"}
+
+# 太阳能相关属性：白天应有非零值，夜间为0正常；列名含这些关键词的自动识别
+SOLAR_KEYWORDS = ["solar", "radiation", "日照", "辐射"]
+
+# 理论上全天不为0的属性：值为0一定是数据异常
+# 大气长波辐射、相对湿度等物理量不可能严格为0
+NEVER_ZERO_KEYWORDS = ["thermal_radiation", "humidity", "热辐射", "湿度"]
+
+
+# =============================================================================
 # 数据读取模块
 # =============================================================================
 
@@ -84,16 +98,6 @@ def read_csv_safe(filepath: str, chunksize: Optional[int] = None) -> pd.DataFram
 def parse_time_format_a(series: pd.Series) -> pd.Series:
     """
     解析文件a的时间格式 "YYYYMMDDHHMM"（如202401030000）。
-
-    Parameters
-    ----------
-    series : pd.Series
-        原始时间列数据。
-
-    Returns
-    -------
-    pd.Series
-        解析后的datetime序列。
     """
     return pd.to_datetime(series.astype(str), format="%Y%m%d%H%M", errors="coerce")
 
@@ -101,39 +105,12 @@ def parse_time_format_a(series: pd.Series) -> pd.Series:
 def parse_time_format_b(series: pd.Series) -> pd.Series:
     """
     解析文件b的时间格式 "YYYY/M/D HH:MM:SS"（如2024/1/3 00:00:00）。
-
-    Parameters
-    ----------
-    series : pd.Series
-        原始时间列数据。
-
-    Returns
-    -------
-    pd.Series
-        解析后的datetime序列。
     """
     return pd.to_datetime(series, errors="coerce")
 
 
 def auto_detect_time_column(df: pd.DataFrame) -> str:
-    """
-    自动检测DataFrame中的时间列。
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        输入数据。
-
-    Returns
-    -------
-    str
-        时间列名。
-
-    Raises
-    ------
-    ValueError
-        未找到时间列时抛出。
-    """
+    """自动检测DataFrame中的时间列。"""
     time_keywords = ["time", "date", "datetime", "timestamp", "时间", "日期"]
     for col in df.columns:
         if col.strip().lower() in time_keywords:
@@ -142,36 +119,22 @@ def auto_detect_time_column(df: pd.DataFrame) -> str:
 
 
 def standardize_time(df: pd.DataFrame, time_col: str, fmt: str) -> pd.DataFrame:
-    """
-    将时间列标准化为datetime格式，并重命名为"time"。
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        输入数据。
-    time_col : str
-        时间列名。
-    fmt : str
-        时间格式标识，"a" 表示 YYYYMMDDHHMM，"b" 表示 YYYY/M/D HH:MM:SS。
-
-    Returns
-    -------
-    pd.DataFrame
-        时间列标准化后的数据。
-
-    Raises
-    ------
-    ValueError
-        时间解析失败率过高时抛出。
-    """
+    """将时间列标准化为datetime格式，并重命名为"time"。"""
     df = df.copy()
 
+    parsed = None
     if fmt == "a":
-        df["time"] = parse_time_format_a(df[time_col])
+        parsed = parse_time_format_a(df[time_col])
     elif fmt == "b":
-        df["time"] = parse_time_format_b(df[time_col])
+        parsed = parse_time_format_b(df[time_col])
     else:
-        df["time"] = pd.to_datetime(df[time_col], errors="coerce")
+        parsed = pd.to_datetime(df[time_col], errors="coerce")
+
+    if time_col == "time":
+        df["time"] = parsed
+    else:
+        df = df.drop(columns=[time_col])
+        df["time"] = parsed
 
     na_count = df["time"].isna().sum()
     if na_count > len(df) * 0.1:
@@ -181,7 +144,6 @@ def standardize_time(df: pd.DataFrame, time_col: str, fmt: str) -> pd.DataFrame:
         logger.warning(f"时间解析失败 {na_count} 行，已剔除")
         df = df.dropna(subset=["time"])
 
-    df = df.drop(columns=[time_col])
     return df
 
 
@@ -199,47 +161,22 @@ def merge_on_time(
 
     文件b的时间记录为最终结果：a缺失b的时间补NaN，a多余的时间丢弃。
     文件a的选定列追加在文件b最后一列之后。
-
-    Parameters
-    ----------
-    df_a : pd.DataFrame
-        文件a数据，需包含time列和selected_columns_a中的列。
-    df_b : pd.DataFrame
-        文件b数据，需包含time列。
-    selected_columns_a : List[str]
-        从文件a中选择的属性列。
-
-    Returns
-    -------
-    pd.DataFrame
-        合并后的数据。
-
-    Raises
-    ------
-    ValueError
-        选择的列不存在时抛出。
     """
     for col in selected_columns_a:
         if col not in df_a.columns:
             raise ValueError(f"文件a中不存在列: '{col}'，可用列: {list(df_a.columns)}")
 
-    # 精确到分钟对齐
     df_a = df_a.copy()
     df_b = df_b.copy()
     df_a["time"] = df_a["time"].dt.floor("min")
     df_b["time"] = df_b["time"].dt.floor("min")
 
-    # 去重，保留最后一条
     df_a = df_a.drop_duplicates(subset="time", keep="last")
     df_b = df_b.drop_duplicates(subset="time", keep="last")
 
-    # 只保留文件a中需要的列
     df_a_subset = df_a[["time"] + selected_columns_a].copy()
 
-    # 以文件b的time为基准左连接
     merged = df_b.merge(df_a_subset, on="time", how="left")
-
-    # 按文件b的时间排序
     merged = merged.sort_values("time").reset_index(drop=True)
 
     logger.info(
@@ -253,20 +190,30 @@ def merge_on_time(
 # 数据清洗模块
 # =============================================================================
 
-def detect_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+def classify_column(col: str) -> str:
     """
-    全面检测缺失值，生成统计报告。
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        输入数据。
+    根据列名自动分类属性的昼夜分布类型。
 
     Returns
     -------
-    pd.DataFrame
-        缺失值统计表，包含每列的缺失数量和缺失率。
+    str
+        "nighttime_zero": 夜间合法为0（power, sr）
+        "solar": 太阳能相关，白天不应为0，夜间为0正常
+        "never_zero": 理论上全天不为0，为0一定是异常
+        "other": 其他（如温度，0可能是有效物理值）
     """
+    col_lower = col.lower()
+    if col in NIGHTTIME_ZERO_COLS:
+        return "nighttime_zero"
+    if any(k in col_lower for k in SOLAR_KEYWORDS):
+        return "solar"
+    if any(k in col_lower for k in NEVER_ZERO_KEYWORDS):
+        return "never_zero"
+    return "other"
+
+
+def detect_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    """全面检测缺失值，生成统计报告。"""
     total = len(df)
     missing_count = df.isna().sum()
     missing_ratio = missing_count / total
@@ -297,8 +244,6 @@ def handle_missing_values(
 
     Parameters
     ----------
-    df : pd.DataFrame
-        含缺失值的数据。
     strategy : str
         处理策略:
         - "drop": 删除含缺失值的行
@@ -309,13 +254,6 @@ def handle_missing_values(
         - "ffill": 前向填充
         - "bfill": 后向填充
         - "custom": 用fill_value填充
-    fill_value : float, optional
-        strategy为"custom"时使用的填充值。
-
-    Returns
-    -------
-    Tuple[pd.DataFrame, Dict]
-        处理后的数据和处理记录。
     """
     df = df.copy()
     missing_before = df.isna().sum().sum()
@@ -356,7 +294,6 @@ def handle_missing_values(
 
     elif strategy == "interpolate":
         df[numeric_cols] = df[numeric_cols].interpolate(method="linear", limit_direction="both")
-        # 插值后仍有残留NaN（首尾），用前向/后向填充
         df[numeric_cols] = df[numeric_cols].ffill().bfill()
         logger.info("线性插值填充缺失值")
 
@@ -387,12 +324,23 @@ def handle_missing_values(
 def detect_special_cases(
     df: pd.DataFrame,
     target_columns: List[str],
+    test_cutoff: Optional[str] = None,
     window_hours: int = 24,
     zero_threshold: float = 0.0,
     time_col: str = "time",
+    daytime_start: int = 7,
+    daytime_end: int = 19,
 ) -> List[Dict]:
     """
-    检测"全天限电"等特殊情况：特定列在连续时间窗口内持续为0或接近0。
+    检测异常数据，按列类型和昼夜规律分类处理：
+
+    - nighttime_zero 类（power, sr）：全天为0才判定异常（限电），
+      夜间为0是正常的。检测范围排除测试期数据。
+    - solar 类：只检测白天时段是否全为0。夜间为0正常。
+      检测范围排除测试期数据。
+    - never_zero 类（thermal_radiation, humidity）：任何时刻为0即为异常。
+      全时段检测，不区分昼夜，不排除测试期（因为是外生变量，修正不影响评估公平性）。
+    - other 类：不检测。
 
     Parameters
     ----------
@@ -400,29 +348,37 @@ def detect_special_cases(
         输入数据。
     target_columns : List[str]
         需要检测的列名列表。
+    test_cutoff : str, optional
+        测试期起始日期（如 "2026-03-01"），此日期之后的内生变量数据不参与检测，
+        避免修改真实值影响评估。外生变量不受此限制。None 表示不排除。
     window_hours : int
-        连续时间窗口阈值（小时），默认24。
+        保留参数，按天检测模式下不直接使用。
     zero_threshold : float
-        判定为"持续为0"的阈值，默认0.0（严格为0）。
+        判定为"为0"的阈值，默认0.0。
     time_col : str
         时间列名。
+    daytime_start : int
+        白天开始小时（含），默认7。
+    daytime_end : int
+        白天结束小时（不含），默认19。
 
     Returns
     -------
     List[Dict]
-        检测到的特殊情况列表，每项包含列名、起止时间、持续时长。
+        检测到的特殊情况列表。
     """
     if not target_columns:
         return []
 
-    # 推断时间间隔（分钟）
-    time_diffs = df[time_col].diff().dropna()
-    median_interval = time_diffs.median()
-    interval_minutes = median_interval.total_seconds() / 60
-    window_points = int(window_hours * 60 / interval_minutes)
+    df = df.copy()
+    df["_hour"] = df[time_col].dt.hour
+    df["_date"] = df[time_col].dt.date
 
-    if window_points < 1:
-        window_points = 1
+    # 测试期截止：内生变量不修改测试期数据
+    test_cutoff_date = None
+    if test_cutoff:
+        test_cutoff_date = pd.Timestamp(test_cutoff).date()
+        logger.info(f"测试期起始: {test_cutoff}，内生变量不检测此日期之后的数据")
 
     results = []
 
@@ -431,38 +387,93 @@ def detect_special_cases(
             logger.warning(f"检测列不存在: '{col}'，跳过")
             continue
 
-        is_zero = df[col].abs() <= zero_threshold
+        col_type = classify_column(col)
 
-        # 找连续为0的区间
-        groups = (~is_zero).cumsum()
-        zero_segments = is_zero.groupby(groups).apply(
-            lambda x: (x.sum(), x.index[0], x.index[-1]) if x.sum() > 0 else None
-        ).dropna()
+        # other 类不检测
+        if col_type == "other":
+            logger.info(f"列 '{col}' 分类为 'other'，跳过特殊检测")
+            continue
 
-        for _, seg_info in zero_segments.items():
-            if seg_info is None:
+        # 判断该列是否受测试期限制（内生变量受限制，外生变量不受）
+        is_endogenous = col_type == "nighttime_zero"
+        # solar 和 never_zero 属于外生变量，不受测试期限制
+
+        for date, day_df in df.groupby("_date"):
+            # 内生变量：跳过测试期
+            if is_endogenous and test_cutoff_date and date >= test_cutoff_date:
                 continue
-            count, start_idx, end_idx = seg_info
-            if count >= window_points:
-                start_time = df.loc[start_idx, time_col]
-                end_time = df.loc[end_idx, time_col]
-                duration_hours = (end_time - start_time).total_seconds() / 3600
-                results.append({
-                    "column": col,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "duration_hours": round(duration_hours, 2),
-                    "row_count": int(count),
-                    "start_idx": int(start_idx),
-                    "end_idx": int(end_idx),
-                })
+
+            is_abnormal = False
+
+            if col_type == "nighttime_zero":
+                # power, sr: 全天为0才算异常（夜间为0正常但白天也0说明限电）
+                is_abnormal = (day_df[col].abs() <= zero_threshold).all()
+
+            elif col_type == "solar":
+                # 太阳能类：白天时段全为0才算异常
+                day_hours = day_df[
+                    (day_df["_hour"] >= daytime_start) & (day_df["_hour"] < daytime_end)
+                ]
+                if day_hours.empty:
+                    continue
+                is_abnormal = (day_hours[col].abs() <= zero_threshold).all()
+
+            elif col_type == "never_zero":
+                # 全天不应为0的属性：任何时刻为0都算异常
+                zero_mask = day_df[col].abs() <= zero_threshold
+                if zero_mask.any():
+                    is_abnormal = True
+
+            if is_abnormal:
+                if col_type == "never_zero":
+                    # never_zero: 只标记为0的那些行，不是整天
+                    zero_rows = day_df[day_df[col].abs() <= zero_threshold]
+                    start_idx = zero_rows.index[0]
+                    end_idx = zero_rows.index[-1]
+                    start_time = df.loc[start_idx, time_col]
+                    end_time = df.loc[end_idx, time_col]
+                    results.append({
+                        "column": col,
+                        "col_type": col_type,
+                        "date": str(date),
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "duration_hours": round(
+                            (end_time - start_time).total_seconds() / 3600, 2
+                        ),
+                        "row_count": len(zero_rows),
+                        "start_idx": int(start_idx),
+                        "end_idx": int(end_idx),
+                    })
+                else:
+                    # nighttime_zero / solar: 标记整天
+                    start_time = day_df[time_col].iloc[0]
+                    end_time = day_df[time_col].iloc[-1]
+                    start_idx = day_df.index[0]
+                    end_idx = day_df.index[-1]
+                    results.append({
+                        "column": col,
+                        "col_type": col_type,
+                        "date": str(date),
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "duration_hours": round(
+                            (end_time - start_time).total_seconds() / 3600, 2
+                        ),
+                        "row_count": len(day_df),
+                        "start_idx": int(start_idx),
+                        "end_idx": int(end_idx),
+                    })
+
+    df = df.drop(columns=["_hour", "_date"])
 
     if results:
         logger.info(f"检测到 {len(results)} 个特殊情况:")
         for r in results:
             logger.info(
-                f"  列 '{r['column']}': {r['start_time']} ~ {r['end_time']}, "
-                f"持续 {r['duration_hours']} 小时, {r['row_count']} 行"
+                f"  列 '{r['column']}' [{r['col_type']}]: "
+                f"{r['date']}, {r['start_time']} ~ {r['end_time']}, "
+                f"{r['row_count']} 行"
             )
     else:
         logger.info("未检测到特殊情况")
@@ -479,48 +490,78 @@ def handle_special_cases(
     """
     处理检测到的特殊情况。
 
+    根据 col_type 区分处理策略：
+    - nighttime_zero (power, sr): 限电天，推荐 drop（删除整行）或 keep
+    - solar: 白天全0，推荐 drop 或 keep
+    - never_zero: 异常0值，用前后正常值插值替换（不用 drop 或 fill_mean）
+
     Parameters
     ----------
-    df : pd.DataFrame
-        输入数据。
-    special_cases : List[Dict]
-        detect_special_cases的输出。
     strategy : str
-        处理策略:
+        对 nighttime_zero 和 solar 类的处理策略:
         - "drop": 删除整段记录
-        - "fill_mean": 用该列非特殊值的均值替换
+        - "fill_mean": 用非异常值均值替换
         - "fill_median": 用中位数替换
         - "interpolate": 线性插值
         - "keep": 保留不处理
-    time_col : str
-        时间列名。
-
-    Returns
-    -------
-    Tuple[pd.DataFrame, Dict]
-        处理后的数据和处理记录。
+        never_zero 类始终使用插值替换，忽略此参数。
     """
     df = df.copy()
     record = {"strategy": strategy, "cases_handled": 0, "details": []}
 
-    if not special_cases or strategy == "keep":
-        logger.info("特殊情况: 无需处理" if not special_cases else "特殊情况: 保留不处理")
+    if not special_cases:
+        logger.info("特殊情况: 无需处理")
+        return df, record
+
+    # 分类处理
+    never_zero_cases = [c for c in special_cases if c.get("col_type") == "never_zero"]
+    other_cases = [c for c in special_cases if c.get("col_type") != "never_zero"]
+
+    # ---- never_zero 类：强制插值替换 ----
+    if never_zero_cases:
+        for case in never_zero_cases:
+            col = case["column"]
+            mask = (df.index >= case["start_idx"]) & (df.index <= case["end_idx"])
+            # 找到该列中值为0的位置
+            zero_mask = mask & (df[col].abs() <= 1e-10)
+            if zero_mask.any():
+                # 将异常0值设为NaN，然后插值
+                df.loc[zero_mask, col] = np.nan
+                record["cases_handled"] += 1
+                count = zero_mask.sum()
+                record["details"].append(
+                    f"列 '{col}' {case['date']}: {count} 个异常0值 → 插值替换"
+                )
+
+        # 对 never_zero 列做插值
+        never_zero_cols = list(set(c["column"] for c in never_zero_cases))
+        for col in never_zero_cols:
+            if col in df.columns:
+                df[col] = df[col].interpolate(method="linear", limit_direction="both")
+                df[col] = df[col].ffill().bfill()
+
+        logger.info(f"never_zero 类处理: {len(never_zero_cases)} 个区间，插值替换")
+
+    # ---- nighttime_zero / solar 类：按用户策略处理 ----
+    if not other_cases or strategy == "keep":
+        if other_cases:
+            logger.info("nighttime_zero/solar 类: 保留不处理")
         return df, record
 
     if strategy == "drop":
         drop_indices = set()
-        for case in special_cases:
+        for case in other_cases:
             drop_indices.update(range(case["start_idx"], case["end_idx"] + 1))
         existing_indices = set(df.index)
         drop_indices = drop_indices & existing_indices
         before_len = len(df)
         df = df.drop(index=drop_indices).reset_index(drop=True)
-        record["cases_handled"] = len(special_cases)
-        record["details"].append(f"删除 {len(drop_indices)} 行")
-        logger.info(f"特殊情况处理(删除): {before_len} → {len(df)} 行")
+        record["cases_handled"] += len(other_cases)
+        record["details"].append(f"删除 {len(drop_indices)} 行 (限电/太阳能异常)")
+        logger.info(f"nighttime_zero/solar 处理(删除): {before_len} → {len(df)} 行")
 
     elif strategy in ("fill_mean", "fill_median"):
-        for case in special_cases:
+        for case in other_cases:
             col = case["column"]
             mask = (df.index >= case["start_idx"]) & (df.index <= case["end_idx"])
             non_special = df.loc[~mask, col]
@@ -534,18 +575,18 @@ def handle_special_cases(
                 f"列 '{col}' {case['start_time']}~{case['end_time']}: "
                 f"{strategy}={fill_val:.4f}"
             )
-        logger.info(f"特殊情况处理({strategy}): 处理 {record['cases_handled']} 个区间")
+        logger.info(f"nighttime_zero/solar 处理({strategy}): 处理 {len(other_cases)} 个区间")
 
     elif strategy == "interpolate":
-        for case in special_cases:
+        for case in other_cases:
             col = case["column"]
             mask = (df.index >= case["start_idx"]) & (df.index <= case["end_idx"])
             df.loc[mask, col] = np.nan
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         df[numeric_cols] = df[numeric_cols].interpolate(method="linear", limit_direction="both")
         df[numeric_cols] = df[numeric_cols].ffill().bfill()
-        record["cases_handled"] = len(special_cases)
-        logger.info(f"特殊情况处理(插值): 处理 {len(special_cases)} 个区间")
+        record["cases_handled"] += len(other_cases)
+        logger.info(f"nighttime_zero/solar 处理(插值): 处理 {len(other_cases)} 个区间")
 
     else:
         raise ValueError(f"未知策略: {strategy}")
@@ -553,27 +594,67 @@ def handle_special_cases(
     return df, record
 
 
+def validate_data(df: pd.DataFrame, time_col: str = "time") -> Dict:
+    """
+    数据校验：检查各属性是否符合昼夜分布规律。
+
+    Returns
+    -------
+    Dict
+        校验结果，包含各列的违规统计。
+    """
+    df = df.copy()
+    df["_hour"] = df[time_col].dt.hour
+    issues = {}
+
+    for col in df.select_dtypes(include=[np.number]).columns:
+        col_type = classify_column(col)
+        col_issues = []
+
+        if col_type == "never_zero":
+            # 全天不应为0
+            zero_count = (df[col].abs() <= 1e-10).sum()
+            if zero_count > 0:
+                col_issues.append(f"存在 {zero_count} 个0值（应为非零）")
+
+        elif col_type == "nighttime_zero":
+            # 白天（7-19点）不应全为0（但个别点为0可能正常，如早晚过渡）
+            day_df = df[(df["_hour"] >= 7) & (df["_hour"] < 19)]
+            day_zero_count = (day_df[col].abs() <= 1e-10).sum()
+            day_total = len(day_df)
+            if day_total > 0 and day_zero_count == day_total:
+                col_issues.append("白天时段全部为0（可能限电）")
+
+        elif col_type == "solar":
+            # 白天不应全为0
+            day_df = df[(df["_hour"] >= 7) & (df["_hour"] < 19)]
+            day_zero_count = (day_df[col].abs() <= 1e-10).sum()
+            day_total = len(day_df)
+            if day_total > 0 and day_zero_count == day_total:
+                col_issues.append("白天时段全部为0（异常）")
+
+        if col_issues:
+            issues[col] = col_issues
+
+    df = df.drop(columns=["_hour"])
+
+    if issues:
+        logger.warning(f"数据校验发现 {len(issues)} 列存在潜在问题:")
+        for col, col_issues in issues.items():
+            for issue in col_issues:
+                logger.warning(f"  列 '{col}': {issue}")
+    else:
+        logger.info("数据校验通过: 各属性昼夜分布符合预期")
+
+    return issues
+
+
 # =============================================================================
 # 输出模块
 # =============================================================================
 
-def preview_data(
-    df: pd.DataFrame,
-    label: str = "数据",
-    n: int = 5,
-) -> None:
-    """
-    数据预览，展示前后n行和基本统计。
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        数据。
-    label : str
-        数据标签。
-    n : int
-        预览行数。
-    """
+def preview_data(df: pd.DataFrame, label: str = "数据", n: int = 5) -> None:
+    """数据预览，展示前后n行和基本统计。"""
     print(f"\n{'='*60}")
     print(f" {label} 预览")
     print(f"{'='*60}")
@@ -586,20 +667,8 @@ def preview_data(
     print(f"{'='*60}\n")
 
 
-def save_merged_data(
-    df: pd.DataFrame,
-    output_path: str,
-) -> None:
-    """
-    保存合并后的数据到CSV文件。
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        合并后的数据。
-    output_path : str
-        输出文件路径。
-    """
+def save_merged_data(df: pd.DataFrame, output_path: str) -> None:
+    """保存合并后的数据到CSV文件。"""
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     df.to_csv(output_path, index=False)
     logger.info(f"已保存合并结果: {output_path} ({len(df)} 行)")
@@ -617,12 +686,10 @@ class MergeLogger:
         self.logger.setLevel(logging.DEBUG)
         self.logger.handlers.clear()
 
-        # 文件handler
         fh = logging.FileHandler(self.log_path, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 
-        # 控制台handler
         ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(logging.INFO)
         ch.setFormatter(logging.Formatter("%(message)s"))
@@ -702,18 +769,20 @@ def main():
     parser = argparse.ArgumentParser(description="CSV文件时间对齐与数据合并工具")
     parser.add_argument("--file-a", type=str, help="文件a路径")
     parser.add_argument("--file-b", type=str, help="文件b路径")
-    parser.add_argument("--time-col-a", type=str, default=None, help="文件a的时间列名（自动检测则不填）")
-    parser.add_argument("--time-col-b", type=str, default=None, help="文件b的时间列名（自动检测则不填）")
+    parser.add_argument("--time-col-a", type=str, default=None, help="文件a的时间列名")
+    parser.add_argument("--time-col-b", type=str, default=None, help="文件b的时间列名")
     parser.add_argument("--columns-a", type=str, default=None, help="从文件a选择的列，逗号分隔")
     parser.add_argument("--missing-strategy", type=str, default="interpolate",
                         choices=["drop", "fill_zero", "fill_mean", "fill_median", "interpolate", "ffill", "bfill"],
                         help="缺失值处理策略")
     parser.add_argument("--special-strategy", type=str, default="keep",
                         choices=["drop", "fill_mean", "fill_median", "interpolate", "keep"],
-                        help="特殊情况处理策略")
+                        help="特殊情况处理策略（仅对 nighttime_zero/solar 类有效）")
     parser.add_argument("--special-columns", type=str, default=None,
                         help="需要检测特殊情况的列，逗号分隔")
-    parser.add_argument("--window-hours", type=int, default=24, help="特殊情况检测窗口（小时）")
+    parser.add_argument("--test-cutoff", type=str, default=None,
+                        help="测试期起始日期(如2026-03-01)，内生变量不检测此日期之后的数据")
+    parser.add_argument("--window-hours", type=int, default=24, help="保留参数")
     parser.add_argument("--output", type=str, default=None, help="输出文件路径")
     parser.add_argument("--log-dir", type=str, default=".", help="日志目录")
 
@@ -782,6 +851,20 @@ def main():
 
         # ---- 特殊情况检测与处理 ----
         logger.info("=" * 40 + " 特殊情况检测 " + "=" * 40)
+
+        # 打印属性分类信息
+        all_data_cols = [c for c in merged.columns if c != "time"]
+        logger.info("属性昼夜分类:")
+        for col in all_data_cols:
+            col_type = classify_column(col)
+            desc = {
+                "nighttime_zero": "夜间合法为0（内生变量，检测排除测试期）",
+                "solar": "太阳能相关，白天不应为0（检测排除测试期）",
+                "never_zero": "全天不应为0（外生变量，全时段检测）",
+                "other": "其他（不检测）",
+            }
+            logger.info(f"  {col}: {col_type} — {desc[col_type]}")
+
         if args.special_columns:
             special_cols = [c.strip() for c in args.special_columns.split(",")]
         else:
@@ -790,19 +873,18 @@ def main():
 
         special_cases = detect_special_cases(
             merged, target_columns=special_cols,
+            test_cutoff=args.test_cutoff,
             window_hours=args.window_hours, time_col="time"
         )
 
         if special_cases:
             print(f"\n检测到 {len(special_cases)} 个特殊情况:")
             for i, case in enumerate(special_cases, 1):
-                print(f"  {i}. 列 '{case['column']}': {case['start_time']} ~ {case['end_time']}, "
-                      f"持续 {case['duration_hours']}h")
+                print(f"  {i}. 列 '{case['column']}' [{case['col_type']}]: "
+                      f"{case['date']}, {case['start_time']} ~ {case['end_time']}, "
+                      f"{case['row_count']} 行")
 
-            special_strategy = args.special_strategy
-            if special_strategy == "keep":
-                print("当前策略: 保留不处理")
-            merged, special_record = handle_special_cases(merged, special_cases, strategy=special_strategy)
+            merged, special_record = handle_special_cases(merged, special_cases, strategy=args.special_strategy)
             merge_log.record_special(special_record)
         else:
             merge_log.record_special({"strategy": "none", "cases_handled": 0})
@@ -814,6 +896,8 @@ def main():
             logger.warning(f"合并后仍有 {remaining_nan} 个缺失值")
         else:
             logger.info("校验通过: 无残留缺失值")
+
+        validation_issues = validate_data(merged, time_col="time")
 
         # ---- 输出 ----
         logger.info("=" * 40 + " 输出结果 " + "=" * 40)
