@@ -486,23 +486,25 @@ def handle_special_cases(
     special_cases: List[Dict],
     strategy: str = "drop",
     time_col: str = "time",
+    **kwargs,
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     处理检测到的特殊情况。
 
     根据 col_type 区分处理策略：
-    - nighttime_zero (power, sr): 限电天，推荐 drop（删除整行）或 keep
-    - solar: 白天全0，推荐 drop 或 keep
-    - never_zero: 异常0值，用前后正常值插值替换（不用 drop 或 fill_mean）
+    - nighttime_zero (power, sr): 限电天，推荐 drop 或 fill_periodic_mean
+    - solar: 白天全0，推荐 drop 或 fill_periodic_mean
+    - never_zero: 异常0值，用前后正常值插值替换
 
     Parameters
     ----------
     strategy : str
         对 nighttime_zero 和 solar 类的处理策略:
         - "drop": 删除整段记录
-        - "fill_mean": 用非异常值均值替换
-        - "fill_median": 用中位数替换
+        - "fill_mean": 用非异常值均值替换（全局均值）
+        - "fill_median": 用中位数替换（全局中位数）
         - "interpolate": 线性插值
+        - "fill_periodic_mean": 多周期平均，用其他天同一时刻的均值替换
         - "keep": 保留不处理
         never_zero 类始终使用插值替换，忽略此参数。
     """
@@ -587,6 +589,53 @@ def handle_special_cases(
         df[numeric_cols] = df[numeric_cols].ffill().bfill()
         record["cases_handled"] += len(other_cases)
         logger.info(f"nighttime_zero/solar 处理(插值): 处理 {len(other_cases)} 个区间")
+
+    elif strategy == "fill_periodic_mean":
+        # 多周期平均：用相邻周期（天）同一时刻位置的均值替换异常区间
+        # 每个周期 = 96 个点（1天，15min间隔）
+        # neighbors 控制使用前后各几天的数据，避免季节性失真
+        period_len = 96
+        neighbors = kwargs.get("periodic_neighbors", 3)
+        for case in other_cases:
+            col = case["column"]
+            start_idx = case["start_idx"]
+            end_idx = case["end_idx"]
+            # 计算该区间内每个点在周期中的位置 (0~95)
+            positions_in_period = (np.arange(start_idx, end_idx + 1)) % period_len
+            # 计算异常区间所属的周期编号和前后的邻居周期范围
+            case_period_num = start_idx // period_len
+            min_period = max(0, case_period_num - neighbors)
+            total_len = len(df)
+            max_period = (total_len - 1) // period_len
+            max_period = min(max_period, case_period_num + neighbors)
+            fill_values = np.full(end_idx - start_idx + 1, np.nan)
+            for i, pos in enumerate(positions_in_period):
+                # 收集邻居周期中同一位置的值
+                neighbor_values = []
+                for p in range(min_period, max_period + 1):
+                    if p == case_period_num:
+                        continue  # 跳过异常区间所在周期
+                    idx = p * period_len + pos
+                    if 0 <= idx < total_len and idx in df.index:
+                        val = df.loc[idx, col]
+                        if not pd.isna(val):
+                            neighbor_values.append(val)
+                if neighbor_values:
+                    fill_values[i] = np.mean(neighbor_values)
+                else:
+                    fill_values[i] = 0.0
+            for i, idx in enumerate(range(start_idx, end_idx + 1)):
+                if idx in df.index:
+                    df.loc[idx, col] = fill_values[i]
+            record["cases_handled"] += 1
+            record["details"].append(
+                f"列 '{col}' {case['start_time']}~{case['end_time']}: "
+                f"多周期平均替换 (周期=96点, 前后各{neighbors}天)"
+            )
+        logger.info(
+            f"nighttime_zero/solar 处理(多周期平均, 前后各{neighbors}天): "
+            f"处理 {len(other_cases)} 个区间"
+        )
 
     else:
         raise ValueError(f"未知策略: {strategy}")
@@ -776,10 +825,12 @@ def main():
                         choices=["drop", "fill_zero", "fill_mean", "fill_median", "interpolate", "ffill", "bfill"],
                         help="缺失值处理策略")
     parser.add_argument("--special-strategy", type=str, default="keep",
-                        choices=["drop", "fill_mean", "fill_median", "interpolate", "keep"],
+                        choices=["drop", "fill_mean", "fill_median", "interpolate", "fill_periodic_mean", "keep"],
                         help="特殊情况处理策略（仅对 nighttime_zero/solar 类有效）")
     parser.add_argument("--special-columns", type=str, default=None,
                         help="需要检测特殊情况的列，逗号分隔")
+    parser.add_argument("--periodic-neighbors", type=int, default=3,
+                        help="fill_periodic_mean策略使用前后各几天的数据，默认3")
     parser.add_argument("--test-cutoff", type=str, default=None,
                         help="测试期起始日期(如2026-03-01)，内生变量不检测此日期之后的数据")
     parser.add_argument("--window-hours", type=int, default=24, help="保留参数")
@@ -884,7 +935,10 @@ def main():
                       f"{case['date']}, {case['start_time']} ~ {case['end_time']}, "
                       f"{case['row_count']} 行")
 
-            merged, special_record = handle_special_cases(merged, special_cases, strategy=args.special_strategy)
+            merged, special_record = handle_special_cases(
+                merged, special_cases, strategy=args.special_strategy,
+                periodic_neighbors=args.periodic_neighbors,
+            )
             merge_log.record_special(special_record)
         else:
             merge_log.record_special({"strategy": "none", "cases_handled": 0})
