@@ -20,6 +20,13 @@ from ts_benchmark.baselines.utils import (
 from ts_benchmark.models.model_base import ModelBase, BatchMaker
 from ts_benchmark.utils.data_processing import split_time
 from ts_benchmark.baselines.utils import MLP, Conv, CrossAttention
+from ts_benchmark.baselines.post_process_modules import (
+    ResidualCorrection,
+    AsymmetricMSELoss,
+    AsymmetricMAELoss,
+    freeze_module,
+    unfreeze_module,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +54,15 @@ DEFAULT_HYPER_PARAMS = {
     "alpha_cov": 1.0,
     "mlp_hidden_dims": 64,
     "pred_dim": None,
+    "clip_grad_norm": 1.0,
+    "huber_delta": 1.0,
+    "use_residual_correction": False,
+    "residual_correction_hidden": 32,
+    "rc_freeze_main": True,
+    "rc_epochs": 20,
+    "rc_lr": 0.001,
+    "rc_patience": 5,
+    "under_weight": 1.5,
 }
 
 
@@ -131,33 +147,35 @@ class DeepForecastingModelBase(ModelBase):
         return {key: copy.deepcopy(model.state_dict()) for key, model in models.items()}
 
     def _init_criterion(self):
-        """
-        Initializes the task loss function.
-
-        Supports MSELoss, L1Loss (MAE), and HuberLoss depending on `self.config.loss`.
-        """
         if self.config.loss == "MSE":
             return nn.MSELoss()
         elif self.config.loss == "MAE":
             return nn.L1Loss()
+        elif self.config.loss == "Huber":
+            delta = getattr(self.config, "huber_delta", 1.0)
+            return nn.HuberLoss(delta=delta)
+        elif self.config.loss == "AsymmetricMSE":
+            under_weight = getattr(self.config, "under_weight", 1.5)
+            return AsymmetricMSELoss(under_weight=under_weight)
+        elif self.config.loss == "AsymmetricMAE":
+            under_weight = getattr(self.config, "under_weight", 1.5)
+            return AsymmetricMAELoss(under_weight=under_weight)
         else:
-            return nn.HuberLoss(delta=0.5)
+            return nn.SmoothL1Loss()
 
     def _init_optimizer(self, CovariateFusion=None):
         """
         Initializes the optimizer using Adam.
 
-        If `self.CovariateFusion` exists, creates parameter groups with separate learning rates.
+        If `self.CovariateFusion` or `self.ResidualCorrection` exists,
+        creates parameter groups with separate learning rates.
         """
+        param_groups = [{"params": self.model.parameters(), "lr": self.config.lr}]
         if hasattr(self, "CovariateFusion") and self.CovariateFusion is not None:
-            return optim.Adam(
-                [
-                    {"params": self.model.parameters(), "lr": self.config.lr},
-                    {"params": self.CovariateFusion.parameters(), "lr": self.config.lr},
-                ]
-            )
-        else:
-            return optim.Adam(self.model.parameters(), lr=self.config.lr)
+            param_groups.append({"params": self.CovariateFusion.parameters(), "lr": self.config.lr})
+        if hasattr(self, "ResidualCorrection") and self.ResidualCorrection is not None:
+            param_groups.append({"params": self.ResidualCorrection.parameters(), "lr": self.config.lr})
+        return optim.Adam(param_groups)
 
     def _process(self, input, target, input_mark, target_mark, exog_future=None):
         """
@@ -378,6 +396,8 @@ class DeepForecastingModelBase(ModelBase):
                     or config.fusion_method == "conv"
                 ) and self.CovariateFusion is not None:
                     output = self.CovariateFusion(exog_future, output)
+                if self.ResidualCorrection is not None:
+                    output = self.ResidualCorrection(output)
                 output, target = self._post_process(output, target)
                 all_loss = criterion(output, target) + additional_loss
                 loss = all_loss.detach().cpu().numpy()
@@ -432,6 +452,9 @@ class DeepForecastingModelBase(ModelBase):
             raise ValueError(
                 f"pred_dim ({self.config.pred_dim}) cannot exceed series_dim ({series_dim})"
             )
+        # CovariateFusion 实际输入维度: output切片到pred_dim后 + exog_future
+        self.config.fusion_input_dim = self.config.pred_dim + exog_dim
+        self.config.fusion_output_dim = self.config.pred_dim
 
         criterion = self._init_criterion()
         self.model = self._init_model()
@@ -443,12 +466,18 @@ class DeepForecastingModelBase(ModelBase):
             self.CovariateFusion = Conv(self.config)
         else:
             self.CovariateFusion = None
+        # ResidualCorrection 初始设为 None，两阶段训练时在阶段2才创建
+        self.ResidualCorrection = None
         device_ids = np.arange(torch.cuda.device_count()).tolist()
         if len(device_ids) > 1 and self.config.parallel_strategy == "DP":
             self.model = nn.DataParallel(self.model, device_ids=device_ids)
             if self.CovariateFusion is not None:
                 self.CovariateFusion = nn.DataParallel(
                     self.CovariateFusion, device_ids=device_ids
+                )
+            if self.ResidualCorrection is not None:
+                self.ResidualCorrection = nn.DataParallel(
+                    self.ResidualCorrection, device_ids=device_ids
                 )
         print(
             "----------------------------------------------------------",
@@ -539,9 +568,12 @@ class DeepForecastingModelBase(ModelBase):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.early_stopping = self._init_early_stopping()
+        self.check_point = None
         self.model.to(device)
         if self.CovariateFusion is not None:
             self.CovariateFusion.to(device)
+        if self.ResidualCorrection is not None:
+            self.ResidualCorrection.to(device)
         total_params = sum(
             p.numel() for p in self.model.parameters() if p.requires_grad
         )
@@ -583,7 +615,14 @@ class DeepForecastingModelBase(ModelBase):
                     or self.config.fusion_method == "conv"
                     or self.config.fusion_method == "cross_attention"
                 ) and self.CovariateFusion is not None:
+                    output_before_fusion = output.detach().clone()
                     output = self.CovariateFusion(exog_future, output)
+                    # CovariateFusion 独立监控：融合修正量
+                    if i == 0:  # 每 epoch 只打印一次
+                        fusion_diff = (output - output_before_fusion).abs().mean().item()
+                        print(
+                            f"Epoch {epoch+1} CovariateFusion avg correction: {fusion_diff:.6f}"
+                        )
                 output, target = self._post_process(output, target)
 
                 loss = criterion(output, target)
@@ -593,10 +632,13 @@ class DeepForecastingModelBase(ModelBase):
 
                 if config.use_amp == 1:
                     scaler.scale(total_loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=config.clip_grad_norm)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=config.clip_grad_norm)
                     optimizer.step()
 
                 if self.config.lradj == "TST":
@@ -606,20 +648,117 @@ class DeepForecastingModelBase(ModelBase):
                 valid_loss = self.validate(valid_data_loader, series_dim, criterion)
                 improved = self.early_stopping(valid_loss, self.model)
                 if improved:
+                    ckpt_models = {"Model": self.model}
                     if self.CovariateFusion is not None:
-                        self.check_point = self.save_checkpoint(
-                            {
-                                "Model": self.model,
-                                "CovariateFusion": self.CovariateFusion,
-                            }
-                        )
-                    else:
-                        self.check_point = self.save_checkpoint({"Model": self.model})
+                        ckpt_models["CovariateFusion"] = self.CovariateFusion
+                    self.check_point = self.save_checkpoint(ckpt_models)
                 if self.early_stopping.early_stop:
                     break
 
             if self.config.lradj != "TST":
                 self._adjust_lr(optimizer, epoch + 1, config)
+
+        # ======== 阶段2: ResidualCorrection 两阶段训练 ========
+        # 先完整训练主模型(阶段1)，然后冻结主模型，只训练RC(阶段2)
+        if getattr(self.config, "use_residual_correction", False):
+            rc_hidden = getattr(self.config, "residual_correction_hidden", 32)
+            rc_freeze = getattr(self.config, "rc_freeze_main", True)
+
+            # 加载阶段1最优checkpoint
+            if self.check_point is not None:
+                self.model.load_state_dict(self.check_point["Model"])
+                if self.CovariateFusion is not None and "CovariateFusion" in self.check_point:
+                    self.CovariateFusion.load_state_dict(self.check_point["CovariateFusion"])
+
+            if rc_freeze:
+                # 两阶段策略：冻结主模型，只训练RC
+                freeze_module(self.model)
+                if self.CovariateFusion is not None:
+                    freeze_module(self.CovariateFusion)
+                print("=" * 60)
+                print("Phase 2: Training ResidualCorrection (main model FROZEN)")
+                print("=" * 60)
+            else:
+                # 联合训练：主模型也参与更新
+                print("=" * 60)
+                print("Phase 2: Training ResidualCorrection (joint with main model)")
+                print("=" * 60)
+
+            # 创建 ResidualCorrection 模块
+            self.ResidualCorrection = ResidualCorrection(self.config.pred_dim, rc_hidden)
+            self.ResidualCorrection.to(device)
+            if len(device_ids) > 1 and self.config.parallel_strategy == "DP":
+                self.ResidualCorrection = nn.DataParallel(
+                    self.ResidualCorrection, device_ids=device_ids
+                )
+
+            # RC 专用训练参数
+            rc_epochs = getattr(self.config, "rc_epochs", 20)
+            rc_lr = getattr(self.config, "rc_lr", self.config.lr)
+            rc_patience = getattr(self.config, "rc_patience", 5)
+
+            rc_optimizer = optim.Adam(self.ResidualCorrection.parameters(), lr=rc_lr)
+            rc_early_stopping = EarlyStopping(patience=rc_patience)
+
+            rc_params = sum(p.numel() for p in self.ResidualCorrection.parameters() if p.requires_grad)
+            frozen_params = sum(p.numel() for p in self.model.parameters() if not p.requires_grad)
+            print(f"RC trainable: {rc_params}, Main frozen: {frozen_params}, RC epochs: {rc_epochs}")
+
+            # 阶段2训练循环
+            for rc_epoch in range(rc_epochs):
+                if rc_freeze:
+                    self.model.eval()
+                    if self.CovariateFusion is not None:
+                        self.CovariateFusion.eval()
+                else:
+                    self.model.train()
+                    if self.CovariateFusion is not None:
+                        self.CovariateFusion.train()
+                self.ResidualCorrection.train()
+
+                epoch_loss = []
+                for i, (input, target, input_mark, target_mark) in enumerate(self.train_data_loader):
+                    rc_optimizer.zero_grad()
+                    input, target, input_mark, target_mark = (
+                        input.to(device), target.to(device),
+                        input_mark.to(device), target_mark.to(device),
+                    )
+                    exog_future = target[:, -config.horizon:, series_dim:]
+                    out_loss = self._process(input, target, input_mark, target_mark, exog_future)
+                    additional_loss = out_loss.get("additional_loss", 0)
+                    output = out_loss["output"]
+                    target_slice = target[:, -config.horizon:, :config.pred_dim]
+                    output = output[:, -config.horizon:, :config.pred_dim]
+
+                    if self.CovariateFusion is not None:
+                        output = self.CovariateFusion(exog_future, output)
+                    output = self.ResidualCorrection(output)
+
+                    loss = criterion(output, target_slice) + additional_loss
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.ResidualCorrection.parameters(), max_norm=1.0)
+                    rc_optimizer.step()
+                    epoch_loss.append(loss.item())
+
+                # 验证
+                if train_ratio_in_tv != 1:
+                    valid_loss = self.validate(valid_data_loader, series_dim, criterion)
+                    improved = rc_early_stopping(valid_loss, self.ResidualCorrection)
+                    if improved:
+                        ckpt_models = {"Model": self.model}
+                        if self.CovariateFusion is not None:
+                            ckpt_models["CovariateFusion"] = self.CovariateFusion
+                        ckpt_models["ResidualCorrection"] = self.ResidualCorrection
+                        self.check_point = self.save_checkpoint(ckpt_models)
+                    if rc_early_stopping.early_stop:
+                        print(f"RC early stopping at epoch {rc_epoch+1}")
+                        break
+
+                avg_loss = np.mean(epoch_loss)
+                rc_alpha = self.ResidualCorrection.alpha.item() if not isinstance(self.ResidualCorrection, nn.DataParallel) else self.ResidualCorrection.module.alpha.item()
+                print(f"RC Epoch {rc_epoch+1}/{rc_epochs}, loss: {avg_loss:.6f}, alpha: {rc_alpha:.4f}")
+
+            print("Phase 2 complete.")
 
     def forecast(
             self,
@@ -656,6 +795,13 @@ class DeepForecastingModelBase(ModelBase):
             ):
                 self.CovariateFusion.load_state_dict(
                     self.check_point["CovariateFusion"]
+                )
+            if (
+                    self.ResidualCorrection is not None
+                    and "ResidualCorrection" in self.check_point
+            ):
+                self.ResidualCorrection.load_state_dict(
+                    self.check_point["ResidualCorrection"]
                 )
 
         if self.config.norm:
@@ -703,6 +849,9 @@ class DeepForecastingModelBase(ModelBase):
         if self.CovariateFusion is not None:
             self.CovariateFusion.to(device)
             self.CovariateFusion.eval()
+        if self.ResidualCorrection is not None:
+            self.ResidualCorrection.to(device)
+            self.ResidualCorrection.eval()
         with torch.no_grad():
             answer = None
             while answer is None or answer.shape[0] < horizon:
@@ -718,13 +867,12 @@ class DeepForecastingModelBase(ModelBase):
                         input, target, input_mark, target_mark, exog_future
                     )
                     output = out_loss["output"]
+                    output = output[:, -config.horizon:, :config.pred_dim]
                     if self.CovariateFusion is not None:
-                        output = output[:, -config.horizon:, :series_dim]
                         output = self.CovariateFusion(exog_future, output)
-                        break
-                    else:
-                        output = output[:, -config.horizon:, :series_dim]
-                        break
+                    if self.ResidualCorrection is not None:
+                        output = self.ResidualCorrection(output)
+                    break
 
                 column_num = output.shape[-1]
                 temp = output.cpu().numpy().reshape(-1, column_num)[-config.horizon:]
@@ -776,6 +924,10 @@ class DeepForecastingModelBase(ModelBase):
                 self.CovariateFusion.load_state_dict(
                     self.check_point["CovariateFusion"]
                 )
+            if self.ResidualCorrection is not None:
+                self.ResidualCorrection.load_state_dict(
+                    self.check_point["ResidualCorrection"]
+                )
         if self.model is None:
             raise ValueError("Model not trained. Call the fit() function first.")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -784,6 +936,9 @@ class DeepForecastingModelBase(ModelBase):
         if self.CovariateFusion is not None:
             self.CovariateFusion.to(device)
             self.CovariateFusion.eval()
+        if self.ResidualCorrection is not None:
+            self.ResidualCorrection.to(device)
+            self.ResidualCorrection.eval()
 
         input_data = batch_maker.make_batch(self.config.batch_size, self.config.seq_len)
         input_np = input_data["input"]
@@ -922,11 +1077,22 @@ class DeepForecastingModelBase(ModelBase):
                     input, dec_input, input_mark, target_mark, exog_future1
                 )
                 output = out_loss["output"]
+                # output1: 内生变量预测部分，用于反馈给下一轮
+                output1 = output[:, -self.config.horizon :, :series_dim]
+                # CovariateFusion 作用于 pred_dim 切片
                 if self.CovariateFusion is not None and exog_future is not None:
-                    output1 = output[:, -self.config.horizon :, :series_dim]
-                    output1 = self.CovariateFusion(exog_future1, output1)
-                else:
-                    output1 = output[:, -self.config.horizon :, :series_dim]
+                    pred_part = output[:, -self.config.horizon :, :self.config.pred_dim]
+                    fused = self.CovariateFusion(exog_future1, pred_part)
+                    # 将融合后的 pred_dim 替换回 output1
+                    output1 = torch.cat(
+                        [fused, output1[:, :, self.config.pred_dim:]], dim=-1
+                    )
+                # ResidualCorrection 作用于 pred_dim 切片
+                if self.ResidualCorrection is not None:
+                    rc_part = self.ResidualCorrection(output1[:, :, :self.config.pred_dim])
+                    output1 = torch.cat(
+                        [rc_part, output1[:, :, self.config.pred_dim:]], dim=-1
+                    )
                 column_num = output.shape[-1]
                 real_batch_size = output.shape[0]
                 output = torch.cat(
